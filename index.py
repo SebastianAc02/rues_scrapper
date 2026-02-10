@@ -5,9 +5,13 @@ from playwright.async_api import async_playwright
 
 app = FastAPI(title="OnePay RUES Scraper")
 
+
 @app.get("/")
-async def home():
-    return {"status": "Tryhard Era Active", "service": "RUES Scraper"}
+@app.head("/") # Esto permite que el Health Check de Render pase de una
+async def root():
+    return {"message": "OnePay Scraper Online"}
+
+
 
 @app.get("/get-representatives/{nit}")
 async def get_rues_data(nit: str):

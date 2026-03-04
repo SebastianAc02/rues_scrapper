@@ -1,27 +1,173 @@
 import os
+import re
 import asyncio
 from contextlib import asynccontextmanager, suppress
+from typing import Dict, Any, List
+
 from fastapi import FastAPI, HTTPException
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-# Controla concurrencia para no reventar memoria en planes pequeños
+# =========================
+# Config
+# =========================
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "1"))
 REQUEST_TIMEOUT_MS = int(os.getenv("REQUEST_TIMEOUT_MS", "90000"))
 
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-# Globals reutilizables (evita lanzar Chromium en cada request)
 _pw = None
 _browser = None
 
 
+# =========================
+# Utils
+# =========================
+def _clean_asn(as_number: str) -> str:
+    """
+    Acepta 269822 o AS269822 y devuelve AS269822
+    """
+    if as_number is None:
+        raise ValueError("AS vacío")
+    s = str(as_number).strip().upper()
+    s = s.replace(" ", "")
+    if s.startswith("AS"):
+        s = s[2:]
+    if not s.isdigit():
+        raise ValueError(f"AS inválido: {as_number}")
+    return f"AS{s}"
+
+
+def parse_lacnic_whois(raw_text: str) -> Dict[str, Any]:
+    """
+    Parsea texto whois tipo LACNIC (aut-num, owner, ownerid, person, etc.).
+    Conserva campos repetidos en lista.
+    """
+    if not raw_text:
+        return {}
+
+    data: Dict[str, Any] = {}
+    repeated_keys = {"address", "phone", "country", "created", "changed"}
+
+    lines = raw_text.replace("\r", "").split("\n")
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        # comentarios whois
+        if line.startswith("%"):
+            continue
+        if ":" not in line:
+            continue
+
+        k, v = line.split(":", 1)
+        key = k.strip().lower().replace("-", "_")
+        val = v.strip()
+
+        if key in repeated_keys:
+            if key not in data:
+                data[key] = []
+            data[key].append(val)
+        else:
+            # si se repite un campo "normal", lo pasamos a lista
+            if key in data:
+                if not isinstance(data[key], list):
+                    data[key] = [data[key]]
+                data[key].append(val)
+            else:
+                data[key] = val
+
+    # Normalizaciones útiles
+    if "aut_num" not in data and "autnum" in data:
+        data["aut_num"] = data["autnum"]
+
+    # Campo directo para matching por nombre
+    owner = data.get("owner")
+    if isinstance(owner, list):
+        owner = owner[0] if owner else ""
+    data["owner_name"] = owner or ""
+
+    return data
+
+
+async def extract_bgp_data(page) -> Dict[str, Any]:
+    """
+    Extrae:
+    - título/nombre mostrado arriba
+    - website mostrado arriba
+    - raw whois del tab Whois
+    - parse whois
+    """
+    # Intentar activar tab Whois
+    whois_tab_candidates = [
+        "a:has-text('Whois')",
+        "button:has-text('Whois')",
+        "text=Whois",
+    ]
+    for sel in whois_tab_candidates:
+        with suppress(Exception):
+            loc = page.locator(sel).first
+            if await loc.count() > 0 and await loc.is_visible():
+                await loc.click(timeout=5000)
+                await page.wait_for_timeout(800)
+                break
+
+    # Nombre mostrado (ej: COLOMBIA MAS TV S.A.S)
+    display_name = ""
+    with suppress(Exception):
+        h1 = page.locator("h1").first
+        if await h1.count() > 0:
+            display_name = (await h1.inner_text()).strip()
+
+    # Website mostrado arriba
+    website = ""
+    with suppress(Exception):
+        # primero intenta link http/https visible en cabecera
+        a = page.locator("a[href^='http']").first
+        if await a.count() > 0:
+            website = (await a.get_attribute("href") or "").strip()
+
+    # Raw Whois: intentar en <pre>, si no en tab activa, si no body
+    raw_whois = ""
+    whois_selectors = [
+        "#whois pre",
+        "pre",
+        ".tab-pane.active",
+        "body",
+    ]
+    for sel in whois_selectors:
+        with suppress(Exception):
+            loc = page.locator(sel).first
+            if await loc.count() > 0:
+                txt = (await loc.inner_text()).strip()
+                if "aut-num:" in txt.lower() or "whois.lacnic.net" in txt.lower():
+                    raw_whois = txt
+                    break
+
+    # fallback final body
+    if not raw_whois:
+        with suppress(Exception):
+            raw_whois = (await page.locator("body").inner_text()).strip()
+
+    parsed = parse_lacnic_whois(raw_whois)
+
+    return {
+        "display_name": display_name,
+        "website": website,
+        "whois_raw": raw_whois,
+        "whois_parsed": parsed,
+        # Este campo te sirve directo para match por nombre
+        "owner_for_match": parsed.get("owner_name", "") or display_name or "",
+    }
+
+
+# =========================
+# Lifespan
+# =========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _pw, _browser
 
     _pw = await async_playwright().start()
-
-    # Flags para bajar consumo de RAM/CPU
     _browser = await _pw.chromium.launch(
         headless=True,
         args=[
@@ -41,33 +187,35 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Cierre único global (sin doble cierre por request)
     with suppress(Exception):
         await _browser.close()
     with suppress(Exception):
         await _pw.stop()
 
 
-app = FastAPI(title="OnePay RUES Scraper", lifespan=lifespan)
+app = FastAPI(title="OnePay BGP Tools Scraper", lifespan=lifespan)
 
 
 @app.get("/")
 @app.head("/")
 async def root():
-    return {"message": "OnePay Scraper Online"}
+    return {"message": "OnePay BGP Tools Scraper Online"}
 
 
-@app.get("/get-representatives/{nit}")
-async def get_representatives(nit: str):
+@app.get("/get-bgp-whois/{as_number}")
+async def get_bgp_whois(as_number: str):
     global _browser
 
     async with semaphore:
         context = None
         page = None
-
         try:
             if not _browser:
                 raise HTTPException(status_code=500, detail="Browser no inicializado")
+
+            asn = _clean_asn(as_number)
+            asn_num = asn.replace("AS", "")
+            url = f"https://bgp.tools/as/{asn_num}#whois"
 
             context = await _browser.new_context(
                 user_agent=(
@@ -77,10 +225,9 @@ async def get_representatives(nit: str):
                 ),
                 viewport={"width": 1366, "height": 768},
             )
-
             page = await context.new_page()
 
-            # Bloquear recursos pesados para bajar memoria
+            # bloquear recursos pesados
             async def block_heavy(route):
                 req = route.request
                 if req.resource_type in {"image", "media", "font", "stylesheet"}:
@@ -90,53 +237,30 @@ async def get_representatives(nit: str):
 
             await page.route("**/*", block_heavy)
 
-            # 1) Buscar por NIT
             await page.goto(
-                f"https://www.rues.org.co/buscar/RM/{nit}",
+                url,
                 wait_until="domcontentloaded",
                 timeout=REQUEST_TIMEOUT_MS,
             )
-
-            # 2) Click en "Ver información"
-            btn_info = page.locator("a:has-text('Ver información')").first
-            await btn_info.wait_for(state="visible", timeout=30000)
-            await btn_info.click()
-
-            await page.wait_for_timeout(1200)
-
-            # 3) Click en pestaña "Representante legal"
-            tab_rep = page.locator("a:has-text('Representante legal')").first
-            await tab_rep.wait_for(state="visible", timeout=30000)
-            await tab_rep.click()
             await page.wait_for_timeout(1500)
 
-            # 4) Traer todo el texto del tab activo (fallbacks)
-            raw_text = ""
-            active_tab = page.locator(".tab-pane.active")
-            if await active_tab.count() > 0:
-                raw_text = (await active_tab.first.inner_text()).strip()
-
-            if not raw_text:
-                content = page.locator(".tab-content")
-                if await content.count() > 0:
-                    raw_text = (await content.first.inner_text()).strip()
-
-            if not raw_text:
-                raw_text = (await page.locator("body").inner_text()).strip()
+            extracted = await extract_bgp_data(page)
 
             return {
                 "success": True,
-                "nit": nit,
+                "query_as_input": as_number,
+                "query_as_normalized": asn,
                 "source_url": page.url,
-                "raw_text": raw_text,
+                **extracted,
             }
 
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
         except PlaywrightTimeoutError:
-            raise HTTPException(status_code=504, detail="Timeout navegando RUES")
+            raise HTTPException(status_code=504, detail="Timeout navegando BGP Tools")
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error scraping RUES: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error scraping BGP Tools: {str(e)}")
         finally:
-            # Cierre seguro por request (sin romper si ya cerró)
             if page:
                 with suppress(Exception):
                     await page.close()
@@ -147,6 +271,5 @@ async def get_representatives(nit: str):
 
 if __name__ == "__main__":
     import uvicorn
-
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("index:app", host="0.0.0.0", port=port, reload=False)

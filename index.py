@@ -1,5 +1,6 @@
 import os
 import re
+import socket
 import asyncio
 from contextlib import asynccontextmanager, suppress
 from typing import Dict, Any
@@ -12,6 +13,7 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 # =========================
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "1"))
 REQUEST_TIMEOUT_MS = int(os.getenv("REQUEST_TIMEOUT_MS", "90000"))
+WHOIS_TIMEOUT_SEC = int(os.getenv("WHOIS_TIMEOUT_SEC", "20"))
 
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
@@ -39,7 +41,8 @@ def _is_noise_title(value: str) -> bool:
     v = value.strip().lower()
     noise = {
         "view", "edit", "overview", "prefixes", "connectivity", "whois",
-        "search", "login", "bgp.tools"
+        "search", "login", "bgp.tools", "scripting/api", "credits", "pricing",
+        "contact us", "issue tracker", "contribute data"
     }
     return v in noise
 
@@ -86,8 +89,25 @@ def parse_lacnic_whois(raw_text: str) -> Dict[str, Any]:
     return data
 
 
+def whois_query_lacnic(asn: str, timeout: int = 20) -> str:
+    """
+    Consulta WHOIS directo a whois.lacnic.net:43
+    """
+    query = f"{asn}\r\n".encode("utf-8")
+    chunks = []
+    with socket.create_connection(("whois.lacnic.net", 43), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        sock.sendall(query)
+        while True:
+            data = sock.recv(4096)
+            if not data:
+                break
+            chunks.append(data)
+    return b"".join(chunks).decode("utf-8", errors="ignore")
+
+
 def _extract_company_from_body(body_text: str) -> str:
-    # Caso típico visible en bgp.tools:
+    # Ejemplo:
     # FIESTA TELECOMUNICACIONES SAS
     # AS Number 273187
     m = re.search(r"\n\s*([A-Z0-9ÁÉÍÓÚÑ .,&\-]{4,})\s*\n\s*AS Number\s+\d+", body_text, re.IGNORECASE)
@@ -96,7 +116,6 @@ def _extract_company_from_body(body_text: str) -> str:
         if not _is_noise_title(name):
             return name
 
-    # fallback por línea previa a "AS Number"
     lines = [ln.strip() for ln in body_text.splitlines() if ln.strip()]
     for i, ln in enumerate(lines):
         if re.search(r"^AS Number\s+\d+", ln, re.IGNORECASE) and i > 0:
@@ -107,13 +126,11 @@ def _extract_company_from_body(body_text: str) -> str:
 
 
 def _extract_website_from_body(body_text: str) -> str:
-    # Busca URLs en texto
     m = re.search(r"(https?://[^\s]+)", body_text, re.IGNORECASE)
     return m.group(1).strip() if m else ""
 
 
 def _extract_whois_block(body_text: str) -> str:
-    # Si viene bloque whois real de LACNIC, normalmente trae "% Joint Whois" o "aut-num:"
     low = body_text.lower()
     if "% joint whois" in low:
         start = low.find("% joint whois")
@@ -123,12 +140,10 @@ def _extract_whois_block(body_text: str) -> str:
         start = low.find("aut-num:")
         return body_text[start:].strip()
 
-    # fallback: devolver body completo (para debug)
     return body_text.strip()
 
 
 async def extract_bgp_data(page) -> Dict[str, Any]:
-    # Intentar activar tab Whois
     for sel in ["a:has-text('Whois')", "button:has-text('Whois')", "text=Whois"]:
         with suppress(Exception):
             loc = page.locator(sel).first
@@ -141,7 +156,6 @@ async def extract_bgp_data(page) -> Dict[str, Any]:
     with suppress(Exception):
         body_text = (await page.locator("body").inner_text()).strip()
 
-    # display_name robusto
     display_name = ""
     with suppress(Exception):
         h1 = page.locator("h1").first
@@ -153,12 +167,11 @@ async def extract_bgp_data(page) -> Dict[str, Any]:
     if not display_name:
         display_name = _extract_company_from_body(body_text)
 
-    # website robusto (evita agarrar link de issue tracker)
     website = ""
     with suppress(Exception):
         links = page.locator("a[href^='http']")
         n = await links.count()
-        for i in range(min(n, 20)):
+        for i in range(min(n, 30)):
             href = (await links.nth(i).get_attribute("href") or "").strip()
             txt = (await links.nth(i).inner_text() or "").strip().lower()
             if not href:
@@ -167,14 +180,12 @@ async def extract_bgp_data(page) -> Dict[str, Any]:
                 continue
             if txt in {"issue tracker", "contact us", "pricing", "login"}:
                 continue
-            if href.startswith("http"):
-                website = href
-                break
+            website = href
+            break
 
     if not website:
         website = _extract_website_from_body(body_text)
 
-    # whois raw y parsed
     raw_whois = _extract_whois_block(body_text)
     parsed = parse_lacnic_whois(raw_whois)
 
@@ -323,7 +334,7 @@ async def get_representatives(nit: str):
 
 
 # =========================
-# Endpoint 2 (BGP) - MISMO NOMBRE
+# Endpoint 2 (BGP) - MISMO NOMBRE + fallback whois
 # =========================
 @app.get("/get-bgp-whois/{as_number}")
 async def get_bgp_whois(as_number: str):
@@ -368,11 +379,26 @@ async def get_bgp_whois(as_number: str):
 
             extracted = await extract_bgp_data(page)
 
+            whois_source = "bgp.tools"
+            if extracted.get("scraping_warning"):
+                lacnic_raw = await asyncio.to_thread(whois_query_lacnic, asn, WHOIS_TIMEOUT_SEC)
+                lacnic_parsed = parse_lacnic_whois(lacnic_raw)
+
+                extracted["whois_raw"] = lacnic_raw
+                extracted["whois_parsed"] = lacnic_parsed
+                extracted["owner_for_match"] = (
+                    lacnic_parsed.get("owner_name", "")
+                    or lacnic_parsed.get("person_name", "")
+                    or extracted.get("display_name", "")
+                )
+                whois_source = "whois.lacnic.net (fallback)"
+
             return {
                 "success": True,
                 "query_as_input": as_number,
                 "query_as_normalized": asn,
                 "source_url": page.url,
+                "whois_source": whois_source,
                 **extracted,
             }
 

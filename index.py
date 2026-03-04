@@ -35,16 +35,18 @@ def _clean_asn(as_number: str) -> str:
     return f"AS{s}"
 
 
-def _is_noise_title(value: str) -> bool:
-    if not value:
-        return True
-    v = value.strip().lower()
-    noise = {
-        "view", "edit", "overview", "prefixes", "connectivity", "whois",
-        "search", "login", "bgp.tools", "scripting/api", "credits", "pricing",
-        "contact us", "issue tracker", "contribute data"
-    }
-    return v in noise
+def whois_query_lacnic(asn: str, timeout: int = 20) -> str:
+    query = f"{asn}\r\n".encode("utf-8")
+    chunks = []
+    with socket.create_connection(("whois.lacnic.net", 43), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        sock.sendall(query)
+        while True:
+            data = sock.recv(4096)
+            if not data:
+                break
+            chunks.append(data)
+    return b"".join(chunks).decode("utf-8", errors="ignore")
 
 
 def parse_lacnic_whois(raw_text: str) -> Dict[str, Any]:
@@ -86,126 +88,8 @@ def parse_lacnic_whois(raw_text: str) -> Dict[str, Any]:
 
     data["owner_name"] = owner or ""
     data["person_name"] = person or ""
+
     return data
-
-
-def whois_query_lacnic(asn: str, timeout: int = 20) -> str:
-    """
-    Consulta WHOIS directo a whois.lacnic.net:43
-    """
-    query = f"{asn}\r\n".encode("utf-8")
-    chunks = []
-    with socket.create_connection(("whois.lacnic.net", 43), timeout=timeout) as sock:
-        sock.settimeout(timeout)
-        sock.sendall(query)
-        while True:
-            data = sock.recv(4096)
-            if not data:
-                break
-            chunks.append(data)
-    return b"".join(chunks).decode("utf-8", errors="ignore")
-
-
-def _extract_company_from_body(body_text: str) -> str:
-    # Ejemplo:
-    # FIESTA TELECOMUNICACIONES SAS
-    # AS Number 273187
-    m = re.search(r"\n\s*([A-Z0-9ÁÉÍÓÚÑ .,&\-]{4,})\s*\n\s*AS Number\s+\d+", body_text, re.IGNORECASE)
-    if m:
-        name = m.group(1).strip()
-        if not _is_noise_title(name):
-            return name
-
-    lines = [ln.strip() for ln in body_text.splitlines() if ln.strip()]
-    for i, ln in enumerate(lines):
-        if re.search(r"^AS Number\s+\d+", ln, re.IGNORECASE) and i > 0:
-            prev = lines[i - 1].strip()
-            if not _is_noise_title(prev):
-                return prev
-    return ""
-
-
-def _extract_website_from_body(body_text: str) -> str:
-    m = re.search(r"(https?://[^\s]+)", body_text, re.IGNORECASE)
-    return m.group(1).strip() if m else ""
-
-
-def _extract_whois_block(body_text: str) -> str:
-    low = body_text.lower()
-    if "% joint whois" in low:
-        start = low.find("% joint whois")
-        return body_text[start:].strip()
-
-    if "aut-num:" in low:
-        start = low.find("aut-num:")
-        return body_text[start:].strip()
-
-    return body_text.strip()
-
-
-async def extract_bgp_data(page) -> Dict[str, Any]:
-    for sel in ["a:has-text('Whois')", "button:has-text('Whois')", "text=Whois"]:
-        with suppress(Exception):
-            loc = page.locator(sel).first
-            if await loc.count() > 0 and await loc.is_visible():
-                await loc.click(timeout=5000)
-                await page.wait_for_timeout(900)
-                break
-
-    body_text = ""
-    with suppress(Exception):
-        body_text = (await page.locator("body").inner_text()).strip()
-
-    display_name = ""
-    with suppress(Exception):
-        h1 = page.locator("h1").first
-        if await h1.count() > 0:
-            t = (await h1.inner_text()).strip()
-            if not _is_noise_title(t):
-                display_name = t
-
-    if not display_name:
-        display_name = _extract_company_from_body(body_text)
-
-    website = ""
-    with suppress(Exception):
-        links = page.locator("a[href^='http']")
-        n = await links.count()
-        for i in range(min(n, 30)):
-            href = (await links.nth(i).get_attribute("href") or "").strip()
-            txt = (await links.nth(i).inner_text() or "").strip().lower()
-            if not href:
-                continue
-            if "github.com/bgptools/issues" in href.lower():
-                continue
-            if txt in {"issue tracker", "contact us", "pricing", "login"}:
-                continue
-            website = href
-            break
-
-    if not website:
-        website = _extract_website_from_body(body_text)
-
-    raw_whois = _extract_whois_block(body_text)
-    parsed = parse_lacnic_whois(raw_whois)
-
-    owner_for_match = (
-        parsed.get("owner_name", "")
-        or parsed.get("person_name", "")
-        or display_name
-        or ""
-    )
-
-    scraping_warning = "removed from this page due to a detected scraping campaign" in body_text.lower()
-
-    return {
-        "display_name": display_name,
-        "website": website,
-        "whois_raw": raw_whois,
-        "whois_parsed": parsed,
-        "owner_for_match": owner_for_match,
-        "scraping_warning": scraping_warning,
-    }
 
 
 # =========================
@@ -216,6 +100,7 @@ async def lifespan(app: FastAPI):
     global _pw, _browser
 
     _pw = await async_playwright().start()
+
     _browser = await _pw.chromium.launch(
         headless=True,
         args=[
@@ -251,7 +136,43 @@ async def root():
 
 
 # =========================
-# Endpoint 1 (RUES) - MISMO NOMBRE
+# Endpoint 1: LACNIC WHOIS
+# =========================
+@app.get("/get-bgp-whois/{as_number}")
+async def get_bgp_whois(as_number: str):
+    try:
+        asn = _clean_asn(as_number)
+        raw = await asyncio.to_thread(whois_query_lacnic, asn, WHOIS_TIMEOUT_SEC)
+        parsed = parse_lacnic_whois(raw)
+
+        owner_for_match = (
+            parsed.get("owner_name", "")
+            or parsed.get("person_name", "")
+            or ""
+        )
+
+        return {
+            "success": True,
+            "query_as_input": as_number,
+            "query_as_normalized": asn,
+            "source_url": "whois://whois.lacnic.net",
+            "whois_source": "whois.lacnic.net",
+            "display_name": owner_for_match,
+            "website": "",
+            "whois_raw": raw,
+            "whois_parsed": parsed,
+            "owner_for_match": owner_for_match,
+            "scraping_warning": False
+        }
+
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error consultando WHOIS LACNIC: {str(e)}")
+
+
+# =========================
+# Endpoint 2: RUES normal
 # =========================
 @app.get("/get-representatives/{nit}")
 async def get_representatives(nit: str):
@@ -273,6 +194,7 @@ async def get_representatives(nit: str):
                 ),
                 viewport={"width": 1366, "height": 768},
             )
+
             page = await context.new_page()
 
             async def block_heavy(route):
@@ -324,90 +246,6 @@ async def get_representatives(nit: str):
             raise HTTPException(status_code=504, detail="Timeout navegando RUES")
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error scraping RUES: {str(e)}")
-        finally:
-            if page:
-                with suppress(Exception):
-                    await page.close()
-            if context:
-                with suppress(Exception):
-                    await context.close()
-
-
-# =========================
-# Endpoint 2 (BGP) - MISMO NOMBRE + fallback whois
-# =========================
-@app.get("/get-bgp-whois/{as_number}")
-async def get_bgp_whois(as_number: str):
-    global _browser
-
-    async with semaphore:
-        context = None
-        page = None
-        try:
-            if not _browser:
-                raise HTTPException(status_code=500, detail="Browser no inicializado")
-
-            asn = _clean_asn(as_number)
-            asn_num = asn.replace("AS", "")
-            url = f"https://bgp.tools/as/{asn_num}#whois"
-
-            context = await _browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/119.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1366, "height": 768},
-            )
-            page = await context.new_page()
-
-            async def block_heavy(route):
-                req = route.request
-                if req.resource_type in {"image", "media", "font", "stylesheet"}:
-                    await route.abort()
-                else:
-                    await route.continue_()
-
-            await page.route("**/*", block_heavy)
-
-            await page.goto(
-                url,
-                wait_until="domcontentloaded",
-                timeout=REQUEST_TIMEOUT_MS,
-            )
-            await page.wait_for_timeout(1500)
-
-            extracted = await extract_bgp_data(page)
-
-            whois_source = "bgp.tools"
-            if extracted.get("scraping_warning"):
-                lacnic_raw = await asyncio.to_thread(whois_query_lacnic, asn, WHOIS_TIMEOUT_SEC)
-                lacnic_parsed = parse_lacnic_whois(lacnic_raw)
-
-                extracted["whois_raw"] = lacnic_raw
-                extracted["whois_parsed"] = lacnic_parsed
-                extracted["owner_for_match"] = (
-                    lacnic_parsed.get("owner_name", "")
-                    or lacnic_parsed.get("person_name", "")
-                    or extracted.get("display_name", "")
-                )
-                whois_source = "whois.lacnic.net (fallback)"
-
-            return {
-                "success": True,
-                "query_as_input": as_number,
-                "query_as_normalized": asn,
-                "source_url": page.url,
-                "whois_source": whois_source,
-                **extracted,
-            }
-
-        except ValueError as ve:
-            raise HTTPException(status_code=400, detail=str(ve))
-        except PlaywrightTimeoutError:
-            raise HTTPException(status_code=504, detail="Timeout navegando BGP Tools")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error scraping BGP Tools: {str(e)}")
         finally:
             if page:
                 with suppress(Exception):

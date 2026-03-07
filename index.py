@@ -2,10 +2,12 @@ import os
 import re
 import socket
 import asyncio
+import unicodedata
 from contextlib import asynccontextmanager, suppress
 from typing import Dict, Any
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 # =========================
@@ -19,7 +21,6 @@ semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
 _pw = None
 _browser = None
-
 
 # =========================
 # Utils
@@ -90,6 +91,52 @@ def parse_lacnic_whois(raw_text: str) -> Dict[str, Any]:
     data["person_name"] = person or ""
 
     return data
+
+
+# =========================
+# Text fixing (RUES mojibake)
+# =========================
+MOJIBAKE_HINTS = ("Ã", "Â", "�", "谩", "贸", "铆", "脫", "聽", "帽")
+
+
+def _suspicious_score(s: str) -> int:
+    # Penaliza mezcla rara de caracteres CJK + tokens típicos de mojibake
+    cjk = sum(1 for ch in s if "\u4e00" <= ch <= "\u9fff")
+    hints = sum(s.count(h) for h in MOJIBAKE_HINTS)
+    replacement = s.count("\ufffd")
+    return cjk * 3 + hints * 5 + replacement * 8
+
+
+def _try_recode(s: str, src_encoding: str) -> str:
+    try:
+        return s.encode(src_encoding, errors="strict").decode("utf-8", errors="strict")
+    except Exception:
+        return s
+
+
+def fix_rues_text(s: str) -> str:
+    if not s:
+        return s
+
+    candidates = [s]
+
+    # Primera pasada
+    for enc in ("gb18030", "gbk", "latin-1", "cp1252"):
+        candidates.append(_try_recode(s, enc))
+
+    # Segunda pasada (casos doblemente rotos)
+    for c in list(candidates):
+        for enc in ("gb18030", "gbk", "latin-1"):
+            candidates.append(_try_recode(c, enc))
+
+    best = min(candidates, key=_suspicious_score)
+
+    # Limpieza final
+    best = unicodedata.normalize("NFKC", best)
+    best = best.replace("\u00a0", " ").replace("\u200b", "").replace("\ufeff", "")
+    best = re.sub(r"[ \t]+", " ", best)
+    best = re.sub(r" *\n *", "\n", best)
+    return best.strip()
 
 
 # =========================
@@ -235,12 +282,20 @@ async def get_representatives(nit: str):
             if not raw_text:
                 raw_text = (await page.locator("body").inner_text()).strip()
 
-            return {
+            # Fix mojibake antes de responder
+            raw_text = fix_rues_text(raw_text)
+
+            payload = {
                 "success": True,
                 "nit": nit,
                 "source_url": page.url,
                 "raw_text": raw_text,
             }
+
+            return JSONResponse(
+                content=payload,
+                media_type="application/json; charset=utf-8"
+            )
 
         except PlaywrightTimeoutError:
             raise HTTPException(status_code=504, detail="Timeout navegando RUES")

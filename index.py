@@ -312,7 +312,19 @@ async def get_representatives(nit: str):
             )
 
             search_input = page.get_by_placeholder("Digite su búsqueda")
-            await search_input.wait_for(timeout=15000)
+
+            try:
+                await search_input.wait_for(timeout=15000)
+            except PlaywrightTimeoutError:
+                # El bundle JS principal de rues.org.co no carga (falla del
+                # lado de ellos, no nuestro): su SPA nunca monta y el campo
+                # de busqueda nunca aparece, para nadie. Se distingue de un
+                # NIT no encontrado, que falla mas adelante en el flujo.
+                raise HTTPException(
+                    status_code=503,
+                    detail="RUES no cargó su buscador (falla del sitio de RUES, no del NIT consultado). Reintentar más tarde.",
+                )
+
             await search_input.fill(nit)
 
             search_button = page.locator("button[type='submit']:has-text('Buscar')").first
@@ -349,6 +361,10 @@ async def get_representatives(nit: str):
                     "legal_representatives_raw": raw_text,
                 }
             )
+
+        except HTTPException:
+
+            raise
 
         except PlaywrightTimeoutError:
 

@@ -274,6 +274,23 @@ async def get_bgp_whois(as_number: str):
 # RUES Scraper
 # =========================
 
+async def _extract_company_name(page) -> str:
+    return await page.evaluate(
+        """
+        () => {
+            const main = document.querySelector('main');
+            if (!main) return '';
+            const candidates = main.querySelectorAll('h1, h2, h3, [class*="titulo"]');
+            for (const el of candidates) {
+                const t = el.textContent.trim();
+                if (t && t.length > 3 && t.toUpperCase() !== 'RUES') return t;
+            }
+            return '';
+        }
+        """
+    )
+
+
 @app.get("/get-representatives/{nit}")
 async def get_representatives(nit: str):
 
@@ -283,37 +300,53 @@ async def get_representatives(nit: str):
 
         try:
 
+            # La ruta profunda /buscar/RM/{nit} redirige a home en navegación
+            # directa (sin pasar antes por "/"). RUES es un SPA server-side
+            # rendered que solo entrega resultados cuando la búsqueda se
+            # dispara desde el formulario ya cargado, así que replicamos ese
+            # flujo en vez de saltarnos el home.
             await page.goto(
-                f"https://www.rues.org.co/buscar/RM/{nit}",
+                "https://www.rues.org.co/",
                 wait_until="domcontentloaded",
                 timeout=REQUEST_TIMEOUT_MS,
             )
+
+            search_input = page.get_by_placeholder("Digite su búsqueda")
+            await search_input.wait_for(timeout=15000)
+            await search_input.fill(nit)
+
+            search_button = page.locator("button[type='submit']:has-text('Buscar')").first
+            await search_button.click()
 
             btn = page.locator("a:has-text('Ver información')").first
             await btn.wait_for(timeout=15000)
             await btn.click()
 
-            tab = page.locator("a:has-text('Representante legal')").first
+            # Pestaña por id, no por ".tab-pane.active": ese selector
+            # generico matchea primero el panel de "Información general"
+            # (que también trae la clase "active" fija en el DOM) y devolvía
+            # datos generales en vez del representante legal.
+            tab = page.locator("#detail-tabs-tab-pestana_representante")
             await tab.wait_for(timeout=15000)
             await tab.click()
 
+            content = page.locator("#detail-tabs-tabpane-pestana_representante")
+            await content.wait_for(timeout=15000)
             await page.wait_for_timeout(300)
 
-            content = page.locator(".tab-pane.active")
+            raw_text = fix_rues_text(await content.inner_text())
+            company_name = fix_rues_text(await _extract_company_name(page))
 
-            raw_text = ""
-
-            if await content.count() > 0:
-                raw_text = await content.first.inner_text()
-
-            raw_text = fix_rues_text(raw_text)
+            available = "información no disponible" not in raw_text.lower()
 
             return JSONResponse(
                 content={
                     "success": True,
                     "nit": nit,
+                    "company_name": company_name,
                     "source_url": page.url,
-                    "raw_text": raw_text,
+                    "legal_representatives_available": available,
+                    "legal_representatives_raw": raw_text,
                 }
             )
 
@@ -321,7 +354,7 @@ async def get_representatives(nit: str):
 
             raise HTTPException(
                 status_code=504,
-                detail="Timeout navegando RUES"
+                detail="Timeout navegando RUES (NIT no encontrado o el sitio no respondió)"
             )
 
         except Exception as e:

@@ -1,7 +1,7 @@
 Herramienta HTTP: RUES Scraper (OnePay). Busca una empresa colombiana por NIT y devuelve su razón social y representante legal, a partir del dataset abierto oficial que publica Confecámaras (no scraping del sitio web de RUES).
 
 Endpoint: GET https://rues-scrapper.onrender.com/get-representatives/{nit}
-- {nit}: solo dígitos, sin puntos ni guion de verificación. Ej: 900886219
+- {nit}: acepta el NIT en cualquier formato común — con puntos, con espacios, con o sin el dígito de verificación después del guion. 900886219, 900.886.219, 900886219-2 y 900.886.219-2 dan todos el mismo resultado; el servidor limpia el formato antes de consultar.
 
 Respuesta 200 (éxito):
 {

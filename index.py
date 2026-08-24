@@ -234,7 +234,13 @@ def _query_rues_open_data(nit: str) -> list:
 @app.get("/get-representatives/{nit}")
 async def get_representatives(nit: str):
 
-    nit_digits = re.sub(r"\D", "", nit)
+    # El digito de verificacion (el que va despues del guion, ej. el "-2" de
+    # 900886219-2) no es parte del NIT real: si se manda pegado, la busqueda
+    # no encuentra nada. Se corta ahi antes de limpiar el resto del formato
+    # (puntos, espacios) para que cualquier forma comun de escribir el NIT
+    # funcione igual.
+    nit_sin_dv = nit.split("-")[0]
+    nit_digits = re.sub(r"\D", "", nit_sin_dv)
 
     if not nit_digits:
         raise HTTPException(status_code=400, detail="NIT vacío o mal formado")

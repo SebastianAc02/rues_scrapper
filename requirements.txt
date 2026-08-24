@@ -1,4 +1,3 @@
 fastapi
 uvicorn
 gunicorn
-playwright==1.40.0

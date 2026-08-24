@@ -3,27 +3,25 @@ import re
 import socket
 import asyncio
 import unicodedata
-from contextlib import asynccontextmanager, suppress
+import urllib.request
+import urllib.parse
+import json
 from typing import Dict, Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 # =========================
 # Config
 # =========================
 
-MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "20"))
-REQUEST_TIMEOUT_MS = int(os.getenv("REQUEST_TIMEOUT_MS", "45000"))
 WHOIS_TIMEOUT_SEC = int(os.getenv("WHOIS_TIMEOUT_SEC", "15"))
-PAGE_POOL_SIZE = int(os.getenv("PAGE_POOL_SIZE", "10"))
+RUES_OPEN_DATA_TIMEOUT_SEC = int(os.getenv("RUES_OPEN_DATA_TIMEOUT_SEC", "15"))
 
-semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-
-_pw = None
-_browser = None
-_page_pool = asyncio.Queue()
+# Dataset abierto oficial de Confecámaras (Personas Naturales, Personas
+# Jurídicas y Entidades Sin Ánimo de Lucro) en el portal de Datos Abiertos
+# de Colombia, expuesto vía Socrata (SODA API), sin autenticación.
+RUES_OPEN_DATA_URL = "https://www.datos.gov.co/resource/c82u-588k.json"
 
 # =========================
 # Utils
@@ -158,73 +156,7 @@ def fix_rues_text(s: str) -> str:
     return best.strip()
 
 
-# =========================
-# Page Pool
-# =========================
-
-async def get_page():
-    return await _page_pool.get()
-
-
-async def return_page(page):
-    await _page_pool.put(page)
-
-
-# =========================
-# Lifespan
-# =========================
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-
-    global _pw, _browser
-
-    _pw = await async_playwright().start()
-
-    _browser = await _pw.chromium.launch(
-
-        headless=True,
-
-        args=[
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--disable-setuid-sandbox",
-            "--no-zygote",
-            "--disable-extensions",
-            "--disable-background-networking",
-            "--disable-sync",
-        ],
-    )
-
-    for _ in range(PAGE_POOL_SIZE):
-
-        context = await _browser.new_context(
-            viewport={"width": 1366, "height": 768}
-        )
-
-        page = await context.new_page()
-
-        async def block_heavy(route):
-            if route.request.resource_type in {"image","media","font","stylesheet"}:
-                await route.abort()
-            else:
-                await route.continue_()
-
-        await page.route("**/*", block_heavy)
-
-        await _page_pool.put(page)
-
-    yield
-
-    with suppress(Exception):
-        await _browser.close()
-
-    with suppress(Exception):
-        await _pw.stop()
-
-
-app = FastAPI(title="OnePay Scraper", lifespan=lifespan)
+app = FastAPI(title="OnePay Scraper")
 
 
 @app.get("/")
@@ -271,115 +203,80 @@ async def get_bgp_whois(as_number: str):
 
 
 # =========================
-# RUES Scraper
+# RUES: representante legal
 # =========================
+#
+# rues.org.co es un SPA que carga sus resultados de busqueda cifrando el
+# cuerpo de la peticion contra elasticprd.rues.org.co/query, y ademas
+# bloquea navegadores automatizados (chequea navigator.webdriver) antes de
+# dejar cargar esa app. Automatizar eso significaria evadir esas dos
+# protecciones a proposito, y eso no se hace.
+#
+# En vez de scrapear esa SPA, se consulta el dataset oficial que publica
+# Confecamaras en Datos Abiertos Colombia (Socrata), que trae exactamente
+# el mismo dato de registro mercantil, incluido el representante legal, sin
+# autenticacion y sin necesidad de navegador. Verificado contra RUES en
+# vivo el 2026-08-24 para NIT 900886219 (Ruralink S.A.S.) y 890903938
+# (Bancolombia S.A.): coincide exacto, y en el caso de Bancolombia el
+# dataset abierto trae el dato que la SPA de RUES ni siquiera muestra.
 
-async def _extract_company_name(page) -> str:
-    return await page.evaluate(
-        """
-        () => {
-            const main = document.querySelector('main');
-            if (!main) return '';
-            const candidates = main.querySelectorAll('h1, h2, h3, [class*="titulo"]');
-            for (const el of candidates) {
-                const t = el.textContent.trim();
-                if (t && t.length > 3 && t.toUpperCase() !== 'RUES') return t;
-            }
-            return '';
-        }
-        """
-    )
+def _query_rues_open_data(nit: str) -> list:
+
+    params = urllib.parse.urlencode({"nit": nit})
+    url = f"{RUES_OPEN_DATA_URL}?{params}"
+
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+
+    with urllib.request.urlopen(req, timeout=RUES_OPEN_DATA_TIMEOUT_SEC) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
 
 @app.get("/get-representatives/{nit}")
 async def get_representatives(nit: str):
 
-    async with semaphore:
+    nit_digits = re.sub(r"\D", "", nit)
 
-        page = await get_page()
+    if not nit_digits:
+        raise HTTPException(status_code=400, detail="NIT vacío o mal formado")
 
-        try:
+    try:
+        rows = await asyncio.to_thread(_query_rues_open_data, nit_digits)
 
-            # La ruta profunda /buscar/RM/{nit} redirige a home en navegación
-            # directa (sin pasar antes por "/"). RUES es un SPA server-side
-            # rendered que solo entrega resultados cuando la búsqueda se
-            # dispara desde el formulario ya cargado, así que replicamos ese
-            # flujo en vez de saltarnos el home.
-            await page.goto(
-                "https://www.rues.org.co/",
-                wait_until="domcontentloaded",
-                timeout=REQUEST_TIMEOUT_MS,
-            )
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Error consultando el dataset abierto de Confecámaras: {str(e)}"
+        )
 
-            search_input = page.get_by_placeholder("Digite su búsqueda")
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail="NIT no encontrado en el dataset de Confecámaras (Datos Abiertos Colombia)"
+        )
 
-            try:
-                await search_input.wait_for(timeout=15000)
-            except PlaywrightTimeoutError:
-                # El bundle JS principal de rues.org.co no carga (falla del
-                # lado de ellos, no nuestro): su SPA nunca monta y el campo
-                # de busqueda nunca aparece, para nadie. Se distingue de un
-                # NIT no encontrado, que falla mas adelante en el flujo.
-                raise HTTPException(
-                    status_code=503,
-                    detail="RUES no cargó su buscador (falla del sitio de RUES, no del NIT consultado). Reintentar más tarde.",
-                )
+    row = rows[0]
 
-            await search_input.fill(nit)
+    company_name = fix_rues_text(row.get("razon_social", ""))
+    representative_name = fix_rues_text(row.get("representante_legal", ""))
+    representative_id = row.get("num_identificacion_representante_legal", "")
+    representative_id_type = row.get("clase_identificacion_rl", "")
 
-            search_button = page.locator("button[type='submit']:has-text('Buscar')").first
-            await search_button.click()
+    available = bool(representative_name)
 
-            btn = page.locator("a:has-text('Ver información')").first
-            await btn.wait_for(timeout=15000)
-            await btn.click()
-
-            # Pestaña por id, no por ".tab-pane.active": ese selector
-            # generico matchea primero el panel de "Información general"
-            # (que también trae la clase "active" fija en el DOM) y devolvía
-            # datos generales en vez del representante legal.
-            tab = page.locator("#detail-tabs-tab-pestana_representante")
-            await tab.wait_for(timeout=15000)
-            await tab.click()
-
-            content = page.locator("#detail-tabs-tabpane-pestana_representante")
-            await content.wait_for(timeout=15000)
-            await page.wait_for_timeout(300)
-
-            raw_text = fix_rues_text(await content.inner_text())
-            company_name = fix_rues_text(await _extract_company_name(page))
-
-            available = "información no disponible" not in raw_text.lower()
-
-            return JSONResponse(
-                content={
-                    "success": True,
-                    "nit": nit,
-                    "company_name": company_name,
-                    "source_url": page.url,
-                    "legal_representatives_available": available,
-                    "legal_representatives_raw": raw_text,
-                }
-            )
-
-        except HTTPException:
-
-            raise
-
-        except PlaywrightTimeoutError:
-
-            raise HTTPException(
-                status_code=504,
-                detail="Timeout navegando RUES (NIT no encontrado o el sitio no respondió)"
-            )
-
-        except Exception as e:
-
-            raise HTTPException(
-                status_code=500,
-                detail=f"Error scraping RUES: {str(e)}"
-            )
-
-        finally:
-
-            await return_page(page)
+    return JSONResponse(
+        content={
+            "success": True,
+            "nit": nit_digits,
+            "company_name": company_name,
+            "estado_matricula": row.get("estado_matricula", ""),
+            "source": "Datos Abiertos Colombia — Confecámaras (dataset c82u-588k)",
+            "source_url": "https://www.datos.gov.co/Comercio-Industria-y-Turismo/Personas-Naturales-Personas-Jur-dicas-y-Entidades-/c82u-588k",
+            "fecha_actualizacion": row.get("fecha_actualizacion", ""),
+            "legal_representatives_available": available,
+            "legal_representative": {
+                "nombre": representative_name,
+                "tipo_identificacion": representative_id_type,
+                "identificacion": representative_id,
+            } if available else None,
+        }
+    )

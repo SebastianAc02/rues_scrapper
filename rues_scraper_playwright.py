@@ -7,14 +7,16 @@ from fastapi.responses import JSONResponse
 from playwright.async_api import async_playwright
 from openai import OpenAI
 
-app = FastAPI(title="RUES Full Scraper con IA")
-
-# Configuración
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
+app = FastAPI(title="RUES Full Scraper con IA")
+
 # ============================================================
-# FUNCIÓN PARA EXTRAER TODO EL TEXTO DE LA PÁGINA DE RUES
+# 1. SCRAPEAR LA PÁGINA DE RUES
 # ============================================================
 async def extraer_texto_rues(nit: str) -> str:
     """Scrapea la página de RUES y devuelve TODO el texto visible."""
@@ -22,6 +24,7 @@ async def extraer_texto_rues(nit: str) -> str:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
 
+        # Ir a la página de búsqueda de RUES
         await page.goto("https://www.rues.org.co/")
         await page.fill('input[name="nit"]', nit)
         await page.click('button[type="submit"]')
@@ -37,7 +40,7 @@ async def extraer_texto_rues(nit: str) -> str:
 
 
 # ============================================================
-# FUNCIÓN PARA PROCESAR EL TEXTO CON IA
+# 2. ESTRUCTURAR CON IA
 # ============================================================
 async def estructurar_con_ia(texto: str) -> dict:
     """Envía el texto a OpenAI y devuelve un JSON estructurado."""
@@ -69,10 +72,10 @@ async def estructurar_con_ia(texto: str) -> dict:
         "personas": [
             {{
                 "nombre": "nombre completo",
-                "rol": "Representante Legal Principal | Representante Legal Suplente | Gerente | Revisor Fiscal | Subgerente | Apoderado | Otro",
+                "rol": "Representante Legal Principal | Representante Legal Suplente | Gerente | Subgerente | Revisor Fiscal | Apoderado | Otro",
                 "tipo_identificacion": "CC | NIT | CE | Otro",
                 "identificacion": "número de identificación",
-                "facultades": "texto completo de las facultades (si aplica, solo para el representante legal principal)"
+                "facultades": "texto completo de las facultades (solo para el representante legal principal)"
             }}
         ],
         "facultades_completas": "texto completo de las facultades del representante legal (si aparece)",
@@ -80,9 +83,9 @@ async def estructurar_con_ia(texto: str) -> dict:
     }}
 
     REGLAS IMPORTANTES:
-    1. El texto contiene SECCIONES claramente marcadas como "REPRESENTACION LEGAL (PRINCIPALES)", "REPRESENTACION LEGAL (SUPLENTES)", "FACULTADES", etc.
+    1. El texto contiene SECCIONES claramente marcadas como "REPRESENTACION LEGAL (PRINCIPALES)", "REPRESENTACION LEGAL (SUPLENTES)", "FACULTADES", "REVISORES FISCALES", etc.
     2. Los representantes aparecen como: "CÉDULA - NOMBRE COMPLETO" (ej. "32853968 - ALGARIN ARIZA KAREN LORENA").
-    3. Extrae CADA PERSONA mencionada con un rol específico (representante principal, suplente, gerente, revisor fiscal, etc.).
+    3. Extrae CADA PERSONA mencionada con un rol específico (representante principal, suplente, gerente, subgerente, revisor fiscal, etc.).
     4. Las facultades suelen ser un texto largo que describe las funciones del representante legal.
     5. Si un campo no aparece en el texto, déjalo como string vacío o lista vacía.
     6. Devuelve SOLO el JSON, sin texto adicional.
@@ -108,7 +111,7 @@ async def estructurar_con_ia(texto: str) -> dict:
 
 
 # ============================================================
-# ENDPOINT PRINCIPAL
+# 3. ENDPOINT PRINCIPAL
 # ============================================================
 @app.get("/get-representatives-full/{nit}")
 async def get_representatives_full(nit: str):
@@ -139,7 +142,7 @@ async def get_representatives_full(nit: str):
 
 
 # ============================================================
-# ENDPOINT DE PRUEBA (para ver si el servicio está vivo)
+# 4. ENDPOINT DE PRUEBA
 # ============================================================
 @app.get("/")
 async def root():

@@ -5,3 +5,4 @@ playwright
 pytest
 pytest-asyncio
 pytest-playwright
+gunicorn

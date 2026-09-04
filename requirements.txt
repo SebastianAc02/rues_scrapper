@@ -1,4 +1,7 @@
 fastapi
 uvicorn
-gunicorn
 openai
+playwright
+pytest
+pytest-asyncio
+pytest-playwright

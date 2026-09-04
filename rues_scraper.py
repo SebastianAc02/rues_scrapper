@@ -10,14 +10,16 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from openai import OpenAI  # pip install openai
 
+# =========================
 # Config
+# =========================
 RUES_OPEN_DATA_TIMEOUT_SEC = int(os.getenv("RUES_OPEN_DATA_TIMEOUT_SEC", "15"))
 RUES_OPEN_DATA_URL = "https://www.datos.gov.co/resource/c82u-588k.json"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # o gpt-4o
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # o gpt-4o si quieres más precisión
 
 # =========================
-# Text fixing
+# Text fixing (sin cambios)
 # =========================
 MOJIBAKE_HINTS = ("Ã", "Â", "�", "谩", "贸", "铆", "脫", "聽", "帽")
 
@@ -52,45 +54,23 @@ def _query_rues_open_data(nit: str) -> list:
     with urllib.request.urlopen(req, timeout=RUES_OPEN_DATA_TIMEOUT_SEC) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
-def build_text_for_ai(row: dict) -> str:
+def build_full_text_for_ai(row: dict) -> str:
     """
-    Construye un texto descriptivo con todos los campos relevantes de la fila
-    para que la IA pueda extraer la información.
+    Construye un texto descriptivo con TODOS los campos de la fila,
+    incluyendo los que no están en la lista predefinida.
     """
-    fields = [
-        "razon_social",
-        "nit",
-        "estado_matricula",
-        "fecha_actualizacion",
-        "direccion",
-        "telefono",
-        "email",
-        "actividad_economica",
-        "tamano_empresa",
-        "representante_legal",
-        "num_identificacion_representante_legal",
-        "clase_identificacion_rl",
-        "representante_legal_suplente",
-        "num_identificacion_rl_suplente",
-        # Si hay más campos, se pueden agregar aquí
-    ]
     lines = []
-    for key in fields:
-        val = row.get(key, "")
+    for key, val in row.items():
         if val:
-            lines.append(f"{key.replace('_', ' ').title()}: {val}")
-    # Si hay campos adicionales no listados, se agregan como "Otros datos"
-    extra = {k: v for k, v in row.items() if k not in fields and v}
-    if extra:
-        lines.append("Otros datos:")
-        for k, v in extra.items():
-            lines.append(f"  {k}: {v}")
+            # Limpiar el valor
+            clean_val = fix_rues_text(str(val))
+            lines.append(f"{key.replace('_', ' ').title()}: {clean_val}")
     return "\n".join(lines)
 
 async def parse_with_ai(text: str) -> dict:
     """
-    Envía el texto a la IA para extraer representantes, suplentes, gerentes,
-    teléfonos, correos, direcciones, etc.
+    Envía el texto completo a la IA y le pide que extraiga TODA la información relevante
+    de representantes, cargos, contactos, etc., en una estructura dinámica.
     """
     if not OPENAI_API_KEY:
         raise ValueError("OPENAI_API_KEY no configurada")
@@ -99,49 +79,61 @@ async def parse_with_ai(text: str) -> dict:
 
     prompt = f"""
     Eres un asistente experto en extraer información de certificados de existencia y representación legal (Cámara de Comercio de Colombia).
-    A partir del siguiente texto, extrae y estructura la información de la empresa en JSON.
+    A partir del siguiente texto, extrae y estructura TODA la información relevante de la empresa.
 
-    Cómo leer el texto:
-    - El certificado registra los nombramientos en orden cronológico, cada uno bajo un encabezado tipo
-      "Por Acta número N del [fecha]... se designó a:" seguido de una tabla con columnas
-      CARGO, NOMBRE e IDENTIFICACION (el nombre a veces queda partido en dos líneas).
-    - Un nombramiento más reciente reemplaza al cargo anterior de la misma posición (Principal o Suplente).
-    - Si un acta posterior dice que alguien "renuncia" a un cargo, ese cargo queda vacante desde esa
-      fecha, a menos que un acta aún más reciente nombre un reemplazo. No reportes como vigente a
-      alguien que renunció.
-    - Ignora la sección de "FUNCIONES" (lista numerada de funciones del Gerente General): son cláusulas
-      estándar del certificado, no información de la empresa.
-    - Reporta únicamente el estado VIGENTE a la fecha del documento: representante legal principal
-      actual y suplente actual (si lo hay).
+    El texto contiene información de:
+    - Razón social, NIT, domicilio, dirección, teléfonos, correos.
+    - Representantes legales (principales, suplentes, gerentes, revisores fiscales, apoderados, etc.)
+    - Fechas de nombramiento, actas, etc.
+    - Actividad económica, tamaño de empresa, estado de matrícula.
+
+    IMPORTANTE:
+    - Identifica TODOS los cargos mencionados (Representante Legal Principal, Suplente, Gerente, Revisor Fiscal, Apoderado, etc.).
+    - Para cada cargo, extrae: nombre completo, tipo de identificación (CC, NIT, CE, etc.) y número de identificación.
+    - Si hay varias personas con el mismo cargo, inclúyelas a todas (ej. varios apoderados).
+    - Extrae también cualquier teléfono, correo electrónico o dirección que aparezca.
+    - La estructura de la respuesta debe ser dinámica: si no hay suplente, no aparezca; si hay gerente, que aparezca.
 
     Texto:
     {text}
 
-    Devuelve un JSON con la siguiente estructura:
+    Devuelve un JSON con la siguiente estructura (los campos son ejemplos, ajústalos según lo que encuentres):
     {{
         "empresa": "nombre de la empresa",
         "nit": "NIT sin dígito de verificación",
         "direccion": "dirección completa",
         "telefonos": ["lista de teléfonos encontrados"],
         "correos": ["lista de correos electrónicos encontrados"],
-        "representantes": [
+        "cargos": [
             {{
+                "cargo": "Representante Legal Principal",
                 "nombre": "nombre completo",
-                "rol": "Representante Legal Principal" o "Representante Legal Suplente" o "Gerente" o "Revisor Fiscal",
-                "tipo_identificacion": "CC" o "NIT" o "CE",
-                "identificacion": "número de identificación"
-            }}
-        ],
-        "otros_contactos": [
+                "tipo_identificacion": "CC",
+                "identificacion": "número"
+            }},
             {{
+                "cargo": "Representante Legal Suplente",
                 "nombre": "nombre",
-                "rol": "rol mencionado",
-                "identificacion": "número si aparece"
-            }}
-        ]
+                "tipo_identificacion": "CC",
+                "identificacion": "número"
+            }},
+            {{
+                "cargo": "Gerente General",
+                "nombre": "nombre",
+                "tipo_identificacion": "CC",
+                "identificacion": "número"
+            }},
+            ... (todos los que aparezcan)
+        ],
+        "otros_datos": {{
+            "estado_matricula": "estado",
+            "fecha_actualizacion": "fecha",
+            "actividad_economica": "código",
+            "tamano_empresa": "tamaño"
+        }}
     }}
 
-    Si no encuentras algún campo, déjalo como string vacío o lista vacía.
+    Si no encuentras algún campo, no lo incluyas.
     Solo responde con el JSON, sin texto adicional.
     """
 
@@ -157,17 +149,16 @@ async def parse_with_ai(text: str) -> dict:
     try:
         return json.loads(content)
     except json.JSONDecodeError:
-        # Fallback: si la IA no devuelve JSON válido, devolvemos lo que haya
         return {"raw_ai_response": content, "error": "No se pudo parsear el JSON"}
 
 # =========================
 # FastAPI app
 # =========================
-app = FastAPI(title="OnePay Scraper - RUES con IA")
+app = FastAPI(title="OnePay Scraper - RUES con IA Dinámica")
 
 @app.get("/")
 async def root():
-    return {"message": "OnePay Scraper - RUES con IA Online"}
+    return {"message": "OnePay Scraper - RUES con IA Dinámica Online"}
 
 @app.get("/get-representatives/{nit}")
 async def get_representatives(nit: str):
@@ -192,20 +183,20 @@ async def get_representatives(nit: str):
 
     row = rows[0]
 
-    # Construir el texto para la IA
-    text_for_ai = build_text_for_ai(row)
+    # Construir el texto completo para la IA
+    full_text = build_full_text_for_ai(row)
 
     try:
-        parsed_by_ai = await parse_with_ai(text_for_ai)
+        parsed_by_ai = await parse_with_ai(full_text)
     except Exception as e:
         parsed_by_ai = {"error": str(e)}
 
-    # También devolvemos los campos estructurados para respaldo
+    # También devolvemos los campos básicos estructurados para respaldo
     return JSONResponse(
         content={
             "success": True,
             "nit": nit_digits,
-            "structured": {
+            "structured_basic": {
                 "company_name": fix_rues_text(row.get("razon_social", "")),
                 "estado_matricula": fix_rues_text(row.get("estado_matricula", "")),
                 "fecha_actualizacion": fix_rues_text(row.get("fecha_actualizacion", "")),
@@ -216,6 +207,6 @@ async def get_representatives(nit: str):
                 "tamano_empresa": fix_rues_text(row.get("tamano_empresa", "")),
             },
             "parsed_by_ai": parsed_by_ai,
-            "raw": row,  # Datos crudos para depuración
+            "raw": row,
         }
     )

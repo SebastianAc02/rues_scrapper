@@ -98,8 +98,21 @@ async def parse_with_ai(text: str) -> dict:
     client = OpenAI(api_key=OPENAI_API_KEY)
 
     prompt = f"""
-    Eres un asistente experto en extraer información de registros mercantiles colombianos.
+    Eres un asistente experto en extraer información de certificados de existencia y representación legal (Cámara de Comercio de Colombia).
     A partir del siguiente texto, extrae y estructura la información de la empresa en JSON.
+
+    Cómo leer el texto:
+    - El certificado registra los nombramientos en orden cronológico, cada uno bajo un encabezado tipo
+      "Por Acta número N del [fecha]... se designó a:" seguido de una tabla con columnas
+      CARGO, NOMBRE e IDENTIFICACION (el nombre a veces queda partido en dos líneas).
+    - Un nombramiento más reciente reemplaza al cargo anterior de la misma posición (Principal o Suplente).
+    - Si un acta posterior dice que alguien "renuncia" a un cargo, ese cargo queda vacante desde esa
+      fecha, a menos que un acta aún más reciente nombre un reemplazo. No reportes como vigente a
+      alguien que renunció.
+    - Ignora la sección de "FUNCIONES" (lista numerada de funciones del Gerente General): son cláusulas
+      estándar del certificado, no información de la empresa.
+    - Reporta únicamente el estado VIGENTE a la fecha del documento: representante legal principal
+      actual y suplente actual (si lo hay).
 
     Texto:
     {text}

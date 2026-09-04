@@ -8,12 +8,17 @@ import urllib.parse
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from openai import OpenAI  # pip install openai
 
 # Config
 RUES_OPEN_DATA_TIMEOUT_SEC = int(os.getenv("RUES_OPEN_DATA_TIMEOUT_SEC", "15"))
 RUES_OPEN_DATA_URL = "https://www.datos.gov.co/resource/c82u-588k.json"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # o gpt-4o
 
+# =========================
 # Text fixing
+# =========================
 MOJIBAKE_HINTS = ("Ã", "Â", "�", "谩", "贸", "铆", "脫", "聽", "帽")
 
 def _suspicious_score(s: str) -> int:
@@ -47,11 +52,109 @@ def _query_rues_open_data(nit: str) -> list:
     with urllib.request.urlopen(req, timeout=RUES_OPEN_DATA_TIMEOUT_SEC) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
-app = FastAPI(title="OnePay Scraper - RUES")
+def build_text_for_ai(row: dict) -> str:
+    """
+    Construye un texto descriptivo con todos los campos relevantes de la fila
+    para que la IA pueda extraer la información.
+    """
+    fields = [
+        "razon_social",
+        "nit",
+        "estado_matricula",
+        "fecha_actualizacion",
+        "direccion",
+        "telefono",
+        "email",
+        "actividad_economica",
+        "tamano_empresa",
+        "representante_legal",
+        "num_identificacion_representante_legal",
+        "clase_identificacion_rl",
+        "representante_legal_suplente",
+        "num_identificacion_rl_suplente",
+        # Si hay más campos, se pueden agregar aquí
+    ]
+    lines = []
+    for key in fields:
+        val = row.get(key, "")
+        if val:
+            lines.append(f"{key.replace('_', ' ').title()}: {val}")
+    # Si hay campos adicionales no listados, se agregan como "Otros datos"
+    extra = {k: v for k, v in row.items() if k not in fields and v}
+    if extra:
+        lines.append("Otros datos:")
+        for k, v in extra.items():
+            lines.append(f"  {k}: {v}")
+    return "\n".join(lines)
+
+async def parse_with_ai(text: str) -> dict:
+    """
+    Envía el texto a la IA para extraer representantes, suplentes, gerentes,
+    teléfonos, correos, direcciones, etc.
+    """
+    if not OPENAI_API_KEY:
+        raise ValueError("OPENAI_API_KEY no configurada")
+
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    prompt = f"""
+    Eres un asistente experto en extraer información de registros mercantiles colombianos.
+    A partir del siguiente texto, extrae y estructura la información de la empresa en JSON.
+
+    Texto:
+    {text}
+
+    Devuelve un JSON con la siguiente estructura:
+    {{
+        "empresa": "nombre de la empresa",
+        "nit": "NIT sin dígito de verificación",
+        "direccion": "dirección completa",
+        "telefonos": ["lista de teléfonos encontrados"],
+        "correos": ["lista de correos electrónicos encontrados"],
+        "representantes": [
+            {{
+                "nombre": "nombre completo",
+                "rol": "Representante Legal Principal" o "Representante Legal Suplente" o "Gerente" o "Revisor Fiscal",
+                "tipo_identificacion": "CC" o "NIT" o "CE",
+                "identificacion": "número de identificación"
+            }}
+        ],
+        "otros_contactos": [
+            {{
+                "nombre": "nombre",
+                "rol": "rol mencionado",
+                "identificacion": "número si aparece"
+            }}
+        ]
+    }}
+
+    Si no encuentras algún campo, déjalo como string vacío o lista vacía.
+    Solo responde con el JSON, sin texto adicional.
+    """
+
+    response = await asyncio.to_thread(
+        client.chat.completions.create,
+        model=OPENAI_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1,
+        response_format={"type": "json_object"},
+    )
+
+    content = response.choices[0].message.content
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        # Fallback: si la IA no devuelve JSON válido, devolvemos lo que haya
+        return {"raw_ai_response": content, "error": "No se pudo parsear el JSON"}
+
+# =========================
+# FastAPI app
+# =========================
+app = FastAPI(title="OnePay Scraper - RUES con IA")
 
 @app.get("/")
 async def root():
-    return {"message": "OnePay Scraper - RUES Online"}
+    return {"message": "OnePay Scraper - RUES con IA Online"}
 
 @app.get("/get-representatives/{nit}")
 async def get_representatives(nit: str):
@@ -76,50 +179,30 @@ async def get_representatives(nit: str):
 
     row = rows[0]
 
-    def get_field(key: str, default: str = "") -> str:
-        return fix_rues_text(row.get(key, default))
+    # Construir el texto para la IA
+    text_for_ai = build_text_for_ai(row)
 
-    # Construir lista de representantes
-    representatives = []
+    try:
+        parsed_by_ai = await parse_with_ai(text_for_ai)
+    except Exception as e:
+        parsed_by_ai = {"error": str(e)}
 
-    principal = get_field("representante_legal")
-    principal_id = get_field("num_identificacion_representante_legal")
-    principal_type = get_field("clase_identificacion_rl")
-    if principal:
-        representatives.append({
-            "nombre": principal,
-            "tipo_identificacion": principal_type or "CC",
-            "identificacion": principal_id,
-            "rol": "Representante Legal Principal"
-        })
-
-    suplente = get_field("representante_legal_suplente")
-    suplente_id = get_field("num_identificacion_rl_suplente")
-    if suplente:
-        representatives.append({
-            "nombre": suplente,
-            "tipo_identificacion": "CC",
-            "identificacion": suplente_id,
-            "rol": "Representante Legal Suplente"
-        })
-
-    # Nota: No hay campo "gerente" en este dataset; el principal suele ser el gerente.
-
+    # También devolvemos los campos estructurados para respaldo
     return JSONResponse(
         content={
             "success": True,
             "nit": nit_digits,
-            "company_name": get_field("razon_social"),
-            "estado_matricula": get_field("estado_matricula"),
-            "fecha_actualizacion": get_field("fecha_actualizacion"),
-            "direccion": get_field("direccion"),
-            "telefono": get_field("telefono"),
-            "email": get_field("email"),
-            "actividad_economica": get_field("actividad_economica"),
-            "tamano_empresa": get_field("tamano_empresa"),
-            "representantes": representatives,
-            "source": "Datos Abiertos Colombia — Confecámaras (dataset c82u-588k)",
-            "source_url": "https://www.datos.gov.co/Comercio-Industria-y-Turismo/Personas-Naturales-Personas-Jur-dicas-y-Entidades-/c82u-588k",
-            "raw": row,  # Todos los datos crudos
+            "structured": {
+                "company_name": fix_rues_text(row.get("razon_social", "")),
+                "estado_matricula": fix_rues_text(row.get("estado_matricula", "")),
+                "fecha_actualizacion": fix_rues_text(row.get("fecha_actualizacion", "")),
+                "direccion": fix_rues_text(row.get("direccion", "")),
+                "telefono": fix_rues_text(row.get("telefono", "")),
+                "email": fix_rues_text(row.get("email", "")),
+                "actividad_economica": fix_rues_text(row.get("actividad_economica", "")),
+                "tamano_empresa": fix_rues_text(row.get("tamano_empresa", "")),
+            },
+            "parsed_by_ai": parsed_by_ai,
+            "raw": row,  # Datos crudos para depuración
         }
     )

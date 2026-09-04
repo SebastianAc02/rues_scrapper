@@ -284,5 +284,6 @@ async def get_representatives(nit: str):
                 "tipo_identificacion": representative_id_type,
                 "identificacion": representative_id,
             } if available else None,
+            "raw": row,
         }
     )
